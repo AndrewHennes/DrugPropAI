@@ -6,45 +6,62 @@
 # using Ray for parallelism and runtime-environment isolation.
 # ---------------------------------------------------------------------
 
+###############################################################################
+# Package Imports:
+###############################################################################
+
 from __future__ import annotations
 
-# ── standard lib ─────────────────────────────────────────────────────
-import pathlib
-import cloudpickle as pickle                            # NEW – needed in several places
-from typing import Iterable, Union, Dict, Callable, List, Any, Optional, Sequence, Literal, Generator
+#==============================================================================
+# Built-In Packages:
+#==============================================================================
 from collections import defaultdict
+from functools import cached_property, lru_cache
+from itertools import combinations
 import math
 import os
-from itertools import combinations
-import shutil
-from functools import lru_cache, cached_property
-import pickle
 from pathlib import Path
-
-# ── third-party core ─────────────────────────────────────────────────
-import ray                                  # parallel execution / runtime envs
-import ray.data
-from ray.data import ActorPoolStrategy
-
-import pandas as pd                         # tabular convenience
-import numpy as np                          # numerics
-
-from rdkit import Chem, DataStructs
-from rdkit.Chem import AllChem
-from rdkit import Chem, DataStructs
-from rdkit.Chem import (
-    Descriptors,
-    QED,
-    rdMolDescriptors,
-    Lipinski,
-    Crippen,
-    AllChem,
+import pathlib
+import pickle
+import shutil
+from typing import (
+    Any,
+    Callable,
+    Generator,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Union,
+    Dict
 )
-from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
-from rdkit.DataStructs.cDataStructs import ExplicitBitVect
+
+#==============================================================================
+# Third-Party Packages:
+#==============================================================================
+
+import cloudpickle  # cloud-compatible pickle implementation
+
+import dask.dataframe as dd
+
+import matplotlib
+import matplotlib.pyplot as plt
+
+import numpy as np
+
+import pandas as pd
 
 import pyarrow as pa
 from pyarrow import csv as pa_csv
+
+import ray
+from ray.data import ActorPoolStrategy, Dataset as _RayDataset
+
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem, Crippen, Descriptors, Lipinski, QED, rdMolDescriptors
+from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
+from rdkit.DataStructs.cDataStructs import ExplicitBitVect
 
 ###############################################################################
 # Paths to Environments:
@@ -57,6 +74,9 @@ path_to_minimol_environment = "/Users/asselism/Desktop/Collins_Lab/Environments/
 ###############################################################################
 
 names_for_pseudomonas_aeruginosa = ('PA', "pseudomonas_aeruginosa", "Pseudomonas_aeruginosa", "Pseudomonas aeruginosa")
+names_for_klebsiella_pneumoniae = ('KP',)
+names_for_escherichia_coli = ('EC',)
+names_for_acinetobacter_baumanii = ('AB',)
 
 ###############################################################################
 # Common File Paths:
@@ -68,8 +88,12 @@ seventy_k_tox_data = "/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_
 tox21_data = "/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_Source/Tox21/Unzipped_Files/Modified_Datasets/_tox21-rt-viability-hek293-p1.aggregrated.tsv"
 
 ###############################################################################
-# Simple Functions:
+# Simple Methods:
 ###############################################################################
+
+#==============================================================================
+# Simple Math Methods:
+#==============================================================================
 
 def average(items):
     
@@ -85,29 +109,66 @@ def all_pairs(items):
     for subset in combo(items, 2):
         yield subset
         
-def list_files(directory: str | Path, recursive: bool = False) -> List[Path]:
+#==============================================================================
+# Simple File and Directory-Related Methods:
+#==============================================================================
+        
+def list_files(directory: str | Path,
+               recursive: bool = False,
+               *,
+               absolute: bool = True) -> List[Path]:
     """
     Return a list of file paths contained in *directory*.
 
     Parameters
     ----------
     directory : str | pathlib.Path
-        Path to the directory you want to inspect.
+        Directory to inspect.
     recursive : bool, default False
-        • False → only files directly inside *directory*  
-        • True  → include files in all nested sub-directories
+        False → only direct children  
+        True  → walk the entire tree
+    absolute : bool, default True
+        True  → return absolute paths  
+        False → paths relative to *directory*
 
     Returns
     -------
     List[pathlib.Path]
-        Absolute paths for every file found.
+        Paths for every file found.
+    """
+    directory = Path(directory).expanduser().resolve()
+    pattern = '**/*' if recursive else '*'
+
+    if absolute:
+        return [p for p in directory.glob(pattern) if p.is_file()]
+    else:
+        return [p.relative_to(directory) for p in directory.glob(pattern)]
+    
+def list_dirs(directory: Union[str, Path], recursive: bool = False) -> List[Path]:
+    """
+    Return a list of **directory paths** contained in *directory*.
+
+    Parameters
+    ----------
+    directory : str | pathlib.Path
+        Path to the directory you want to inspect.
+    recursive : bool, default False
+        • False → only immediate sub-directories  
+        • True  → include sub-directories at *all* nested levels
+
+    Returns
+    -------
+    List[pathlib.Path]
+        Absolute paths for every directory found.
     """
     directory = Path(directory).expanduser().resolve()
 
     if recursive:
-        return [p for p in directory.rglob('*') if p.is_file()]
+        # Path.rglob('*') yields everything; filter for directories
+        return [p for p in directory.rglob('*') if p.is_dir()]
     else:
-        return [p for p in directory.iterdir() if p.is_file()]
+        # Path.iterdir() lists immediate children
+        return [p for p in directory.iterdir() if p.is_dir()]
 
 ###############################################################################
 # Ray helper – idempotent initialisation
@@ -119,18 +180,6 @@ def _ensure_ray():
 ###############################################################################
 # Data Table Functionality:
 ###############################################################################
-try:
-    import dask.dataframe as dd
-except ImportError:  # pragma: no cover
-    dd = None
-
-try:
-    import ray
-    from ray.data import Dataset as _RayDataset
-except ImportError:  # pragma: no cover
-    ray = None
-    _RayDataset = object            # type: ignore[assignment]
-# --------------------------------------------------------------------------- #
 
 # ........................................................................... #
 #  Default: promote to Dask when a Pandas frame exceeds this many rows
@@ -190,6 +239,66 @@ class Table:
             raise TypeError(f"Unsupported table type: {type(table)}")
 
         self.smiles_column_name = smiles_column_name
+        
+    # ====================================================================== #
+    #  Simple helpers
+    # ====================================================================== #
+    def get_name(self) -> str | None:
+        return getattr(self, "name", None)
+
+    # ------------------------------------------------------------------ #
+    #  Unique values in a column (materialises the result)
+    # ------------------------------------------------------------------ #
+    def unique(self, column_name: str) -> List[Any]:
+        """
+        Return **all** unique values in *column_name* as a Python list.
+
+        Notes
+        -----
+        * The result is fully collected in‑memory (it has to be a list), so
+          make sure the cardinality of the column is reasonable.
+        * `NaN`/`None` values are preserved.
+        """
+        # ---- input validation ----------------------------------------
+        if self.is_ray():
+            if column_name not in self.table.schema().names:
+                raise KeyError(f"Column {column_name!r} not found")
+        else:
+            if column_name not in self.table.columns:
+                raise KeyError(f"Column {column_name!r} not found")
+
+        # ---- Ray Dataset -------------------------------------------------
+        if self.is_ray():
+            # Newer Ray (≥ 2.3): use the built‑in helper.
+            if hasattr(self.table, "unique"):
+                return self.table.unique(column_name)
+    
+            # Legacy fallback ① (select → distinct)  … works on Ray 2.0–2.2
+            if hasattr(self.table, "select_columns") and hasattr(self.table, "distinct"):
+                return (self.table
+                            .select_columns(column_name)
+                            .distinct()
+                            .to_pandas()[column_name]
+                            .tolist())
+    
+            # Legacy fallback ② (groupby + count)  … works on Ray ≤ 2.0
+            grouped = (self.table
+                           .groupby(column_name)
+                           .count())
+            if hasattr(grouped, "drop_columns"):      # Ray ≥ 1.13
+                grouped = grouped.drop_columns(["count()"])
+            return grouped.to_pandas()[column_name].tolist()
+
+        # ---- Dask DataFrame ------------------------------------------
+        if self.is_dask():
+            # .unique() -> Dask Series -> compute() -> NumPy array
+            return (self.table[column_name]
+                        .unique()
+                        .compute()
+                        .tolist())
+
+        # ---- Pandas DataFrame ----------------------------------------
+        return self.table[column_name].unique().tolist()
 
     # ------------------------------------------------------------------ #
     # Convenience factory (kept for API parity)
@@ -2636,6 +2745,92 @@ def smiles_to_pptx(
     # 3.  Save
     # ------------------------------------------------------------------
     prs.save(str(pathlib.Path(out_path).expanduser().resolve()))
+    
+    
+###############################################################################
+# PCA:
+###############################################################################
+
+def add_pca_components(
+    tbl: Table,
+    feature_func: Callable[[pd.Series], Sequence[float]],
+    *,
+    n_components: int = 2,
+    pca_column_name: str = "PCA",
+    max_rows: int = 1_000_000,
+    inplace: bool = True,
+) -> Table:
+    """
+    Compute principal components from arbitrary per‑row features and
+    store the PC scores as a *list* in a new column.
+
+    Parameters
+    ----------
+    tbl : Table
+        Any project‑level `Table` (Pandas, Dask or Ray).
+    feature_func : Callable[[pd.Series], Sequence[float]]
+        A user‑supplied function that receives one **row** (Pandas
+        `Series`) and returns a 1‑D vector (list / tuple / np.ndarray)
+        of *equal length for every row*.
+    n_components : int, default 2
+        Number of principal components to keep.
+    pca_column_name : str, default "PCA"
+        Name of the output column that will hold the PC coordinate list
+        for each row, e.g.  `[PC1, PC2, …]`.
+    max_rows : int, default 1_000_000
+        Safety guard – refuse to materialise > 1 M rows into memory.
+        Set to `None` to disable (use with caution).
+    inplace : bool, default True
+        • ``True``  → mutate *tbl* and return it  
+        • ``False`` → leave *tbl* untouched and return a *new* Table
+
+    Returns
+    -------
+    Table
+        The enriched table (same back‑end as the input).
+    """
+    # ------------------------------------------------------------------ 1
+    # Collect the data into Pandas (with an explicit memory guard)
+    # ------------------------------------------------------------------
+    df = tbl.to_pandas(max_rows=max_rows).copy()
+
+    # ------------------------------------------------------------------ 2
+    # Build the feature matrix X – one row → feature_func(row)
+    # ------------------------------------------------------------------
+    feats = df.apply(feature_func, axis=1).tolist()
+    X = np.asarray(feats, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("feature_func must return a *1‑D* vector of "
+                         "identical length for every row.")
+    if n_components > X.shape[1]:
+        raise ValueError(f"n_components ({n_components}) exceeds the "
+                         f"feature dimension ({X.shape[1]}).")
+
+    # ------------------------------------------------------------------ 3
+    # PCA via SVD  (NumPy – avoids scikit‑learn dependency)
+    # ------------------------------------------------------------------
+    X_centered = X - X.mean(axis=0, keepdims=True)
+    U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+    scores = X_centered @ Vt.T[:, :n_components]          # (N, k)
+
+    # ------------------------------------------------------------------ 4
+    # Attach the PC score list to every row
+    # ------------------------------------------------------------------
+    df[pca_column_name] = [row.tolist() for row in scores]
+
+    # ------------------------------------------------------------------ 5
+    # Push back into the original container type
+    # ------------------------------------------------------------------
+    if tbl.is_ray():
+        new_obj = ray.data.from_pandas(df)
+    elif tbl.is_dask():
+        # Preserve the original partitioning granularity when possible
+        nparts = tbl.table.npartitions
+        new_obj = dd.from_pandas(df, npartitions=nparts)
+    else:  # already Pandas
+        new_obj = df
+
+    return _maybe_update(tbl, new_obj, inplace=inplace)
 
 ###############################################################################
 # Area Where I Am Testing New Code:
@@ -2649,22 +2844,52 @@ tox21_data = "/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_Source/T
 commercially_available_compounds = "/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_Data_Type/Molecular_Structures/Molecules/Organized_by_Compound_Category/Commercially_Available/14M_deduplicated_combined.tsv"
 eight_k_pseudomonas_screening_results = "/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_Data_Type/Bioactivity/Organized_by_Data_Type/Antimicrobial_Activity/Organized_by_Source/Internal_Collins_Lab_Screens/All_PA_Screen_Results/8K-screen-PA_del6_del3_del40_WT.csv"
 
-# training_set_dir = "/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_Data_Type/Bioactivity/Organized_by_Data_Type/Antimicrobial_Activity/Organized_by_Source/COADD/Modified_Datasets/Datasets_with_Binarized_Hits/Binarization_at_80_Percent_GI/"
-# for file in list_files(training_set_dir):
-#     dataset = to_table(file)
-#     dataset = add_minimol_fingerprints(dataset)
-#     new_fpath = file.with_name(f"{file.stem}_with_Minimol_Representations.tsv")
-#     dataset.to_tsv(new_fpath)
-
-#path = "/Users/asselism/Desktop/Collins_Lab/Analysis/Organized_by_Project/Non-toxic_Antibiotics/Other_Analyses/Tox_Filters_Application_07212025/EC_KP_summary_with_IMR90.csv"
-
-#ds = to_table(path)
-
-#for filt, filt_name in zip(all_tox_filters, all_tox_filter_names):
+def main():
     
-#    ds.assign_rowwise_using(filt_name, lambda row, f=filt: int(f(row["SMILES"])))
+    # for cutoff in (20, ):
     
-#ds.assign_rowwise_using("any_pharma_filter", lambda row: int(any([row[name] for name in all_tox_filter_names])))
-#ds.assign_rowwise_using("all_pharma_filter", lambda row: int(all([row[name] for name in all_tox_filter_names])))
+    #     dataset = to_table(f"/Users/asselism/Desktop/Collins_Lab/Analysis/Organized_by_Project/Efflux/Scripted_Ligand_Analysis/Efflux_Ligand_Results_Cutoff_of_{cutoff}.csv")
+        
+    #     dataset = dataset.filter_rowwise_using(lambda row: any(row[col] for col in ('near_prox_major', 'near_prox_minor', 'near_tm', 'near_distal')))
+        
+    #     smiles = dataset.unique("SMILES")
+        
+    #     smiles = sorted(smiles, key = lambda smiles: get_mw(smiles))
+        
+    #     print(f"For a cutoff of {cutoff}, the SMILES are {smiles}.")
+        
+    #     #assert False
+        
+    #     #dataset.to_tsv("/Users/asselism/Desktop/Collins_Lab/Analysis/Organized_by_Project/Efflux/Scripted_Ligand_Analysis/Efflux_Ligand_Results_Any_Pocket.csv")
     
-#ds.to_csv("/Users/asselism/Desktop/Collins_Lab/Analysis/Organized_by_Project/Non-toxic_Antibiotics/Other_Analyses/Tox_Filters_Application_07212025/EC_KP_summary_with_IMR90_with_all_the_filters.csv")
+    #8k_screen_path = "/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_Data_Type/Bioactivity/Organized_by_Data_Type/Antimicrobial_Activity/Organized_by_Source/Internal_Collins_Lab_Screens/8K_Screen/8K_Active_Learning_Screening_Data/Original_Dataset/8K_Screen_Data.csv"
+    
+    #pa_screen_path = "/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_Data_Type/Bioactivity/Organized_by_Data_Type/Antimicrobial_Activity/Organized_by_Source/Internal_Collins_Lab_Screens/8K_Screen/All_PA_Screen_Results/8K-screen-PA_del6_del3_del40_WT.csv"
+    
+    #tbl = to_table(pa_screen_path)
+    
+    #tbl = tbl.filter_rowwise_using(lambda row: row)
+    
+    fs_cmpds = to_table("/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_Data_Type/Enzyme_Substrate/Organized_by_Source/Papers/Jang_et_al_2023/supplamental_dataset_as_tsv/57_acrb_substrates.tsv")
+    
+    #fs_cmpds.assign_rowwise_using("cLogP", lambda row: get_clogp(row["SMILES"]))
+    
+    #fs_cmpds.assign_rowwise_using("MW", lambda row: get_mw(row["SMILES"]))
+    
+    #fs_cmpds.assign_rowwise_using("TPSA", lambda row: get_tpsa(row["SMILES"]))
+    
+    #fs_cmpds.to_csv("/Users/asselism/Desktop/Collins_Lab/Datasets/Organized_by_Data_Type/Enzyme_Substrate/Organized_by_Source/Papers/Jang_et_al_2023/supplamental_dataset_as_tsv/57_acrb_substrates_with_mw_clogp_tpsa.csv")
+    
+    add_pca_components(fs_cmpds, lambda row: [float(row[col_name]) for col_name in ("MW", "HLB", "logP", "TPSA", "MinProjArea", "MaxProjArea")])
+    
+    fs_cmpds.assign_rowwise_using("component_1", lambda row: row["PCA"][0])
+    
+    fs_cmpds.assign_rowwise_using("component_2", lambda row: row["PCA"][1])
+    
+    directory = "/Users/asselism/Desktop/Collins_Lab/Analysis/Organized_by_Project/Efflux/Rules_for_Efflux/Plots/"
+    
+    scatter_embedding(fs_cmpds, "component_1", "component_2", out_path = directory + "scatter_for_57_substrates.png")
+    
+if __name__ == "__main__":
+    
+    main()
